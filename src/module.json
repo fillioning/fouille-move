@@ -1,0 +1,40 @@
+{
+  "id": "fouille",
+  "name": "Fouille",
+  "version": "0.1.0",
+  "api_version": 2,
+  "description": "Network microsound excavator — fetches sounds from the internet, sculpts with vactrol LPG envelopes",
+  "author": "Vincent Music (fillioning)",
+  "abbrev": "FOUIL",
+  "dsp": "dsp.so",
+  "component_type": "sound_generator",
+  "raw_midi": true,
+  "capabilities": {
+    "audio_out": true,
+    "midi_in": true,
+    "chainable": true,
+    "component_type": "sound_generator",
+    "ui_hierarchy": {
+      "modes": null,
+      "levels": {
+        "root": {
+          "name": "Fouille",
+          "knobs": [
+            {"level": "Excavation", "label": "Excavation"},
+            {"level": "Currents", "label": "Currents"}
+          ]
+        },
+        "Excavation": {
+          "name": "Excavation",
+          "knobs": ["terrain", "depth", "rise", "hold", "fall", "strike", "lock", "erode"],
+          "params": ["terrain", "depth", "rise", "hold", "fall", "strike", "lock", "erode"]
+        },
+        "Currents": {
+          "name": "Currents",
+          "knobs": ["flow", "scatter", "stretch", "grain", "drift", "pool", "spread", "volume"],
+          "params": ["flow", "scatter", "stretch", "grain", "drift", "pool", "spread", "volume"]
+        }
+      }
+    }
+  }
+}
