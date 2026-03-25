@@ -1,38 +1,55 @@
 {
   "id": "fouille",
   "name": "Fouille",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "api_version": 2,
   "description": "Network microsound excavator — fetches sounds from the internet, sculpts with vactrol LPG envelopes",
-  "author": "Vincent Music (fillioning)",
+  "author": "Vincent Fillion (fillioning)",
   "abbrev": "FOUIL",
+  "license": "MIT",
   "dsp": "dsp.so",
   "component_type": "sound_generator",
   "raw_midi": true,
+
+  "defaults": {
+    "terrain": 0.0, "depth": 0.5, "rise": 0.1, "hold": 0.5,
+    "fall": 0.3, "strike": 0.3, "lock": 0.0, "erode": 0.0,
+    "flow": 0.15, "scatter": 0.5, "stretch": 0.5, "grain": 0.2,
+    "drift": 0.3, "pool": 0.0, "spread": 0.7, "volume": 0.6,
+    "mode": 0.0, "city": 0.0, "hood": 0.0
+  },
+
   "capabilities": {
     "audio_out": true,
     "midi_in": true,
     "chainable": true,
     "component_type": "sound_generator",
+
     "ui_hierarchy": {
-      "modes": null,
       "levels": {
         "root": {
           "name": "Fouille",
-          "knobs": [
+          "knobs": ["terrain", "depth", "rise", "hold", "fall", "strike", "lock", "erode"],
+          "params": [
             {"level": "Excavation", "label": "Excavation"},
-            {"level": "Currents", "label": "Currents"}
+            {"level": "Currents", "label": "Currents"},
+            {"level": "Location", "label": "Location"}
           ]
         },
         "Excavation": {
-          "name": "Excavation",
+          "label": "Excavation",
           "knobs": ["terrain", "depth", "rise", "hold", "fall", "strike", "lock", "erode"],
           "params": ["terrain", "depth", "rise", "hold", "fall", "strike", "lock", "erode"]
         },
         "Currents": {
-          "name": "Currents",
+          "label": "Currents",
           "knobs": ["flow", "scatter", "stretch", "grain", "drift", "pool", "spread", "volume"],
           "params": ["flow", "scatter", "stretch", "grain", "drift", "pool", "spread", "volume"]
+        },
+        "Location": {
+          "label": "Location",
+          "knobs": ["mode", "city", "hood", "rise", "hold", "fall", "flow", "volume"],
+          "params": ["mode", "city", "hood", "rise", "hold", "fall", "flow", "volume"]
         }
       }
     }

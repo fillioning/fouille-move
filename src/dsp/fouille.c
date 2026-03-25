@@ -104,6 +104,7 @@ static inline float vactrol_process(vactrol_lpg_t *v, float input,
     float target = v->vactrol_cv;
     float rate = (target > v->vactrol_state) ? rise_rate : fall_rate;
     v->vactrol_state += (target - v->vactrol_state) * rate;
+    if (fabsf(v->vactrol_state) < 1e-15f) v->vactrol_state = 0.0f;
 
     /* Derive amplitude and cutoff from vactrol state */
     float amp = powf(v->vactrol_state, 0.7f + nonlinearity * 0.3f);
@@ -113,6 +114,7 @@ static inline float vactrol_process(vactrol_lpg_t *v, float input,
     float omega = 2.0f * (float)M_PI * cutoff_hz / SAMPLE_RATE;
     float alpha = omega / (omega + 1.0f);
     v->lp_z1 += alpha * (input * amp - v->lp_z1);
+    if (fabsf(v->lp_z1) < 1e-15f) v->lp_z1 = 0.0f;
 
     return v->lp_z1;
 }
@@ -198,6 +200,8 @@ typedef struct {
     atomic_int terrain;          /* 0-7 category index */
     atomic_int depth_pct;        /* 0-100 brightness filter */
     atomic_int flow_seconds;     /* seconds between auto-fetches */
+    atomic_int mode;             /* 0=Fouille (internet), 1=Montreal */
+    atomic_int neighbourhood;    /* 0-15 Montreal neighbourhood index */
 
     uint32_t rng;                /* PRNG for word selection */
     uint32_t tick;               /* monotonic tick counter */
@@ -226,6 +230,11 @@ typedef struct {
     float param_lock;            /* 0-1 → spectral lock Q (0=bypass) */
     float param_erode;           /* 0-1 → erosion rate */
 
+    /* Parameters — Page 3: Location */
+    float param_mode;            /* 0-1 → 0=Fouille, 1=Cities */
+    float param_city;            /* 0-1 → city index (only Montreal for now) */
+    float param_hood;            /* 0-1 → neighbourhood index */
+
     /* Parameters — Page 2: Currents */
     float param_flow;            /* 0-1 → 5s to 120s */
     float param_scatter;         /* 0-1 → velocity randomness */
@@ -248,7 +257,7 @@ typedef struct {
 
     uint32_t rng;                /* master PRNG */
     uint32_t tick;               /* monotonic sample counter */
-    int current_page;            /* 0 = Excavation, 1 = Currents */
+    int current_page;            /* 0 = Excavation, 1 = Currents, 2 = Location */
 } fouille_instance_t;
 
 /* ── Poetic Word Lists ──────────────────────────────────────────────────── */
@@ -275,6 +284,35 @@ static const char *CATEGORY_TERMS[][3] = {
     /* Organic  */ {"body", "liquid", "biological"},
     /* Cosmic   */ {"radio", "electromagnetic", "signal"}
 };
+
+/* ── Montreal Neighbourhoods (Geosonic Seeder) ─────────────────────────── */
+
+typedef struct {
+    const char *name;           /* display name */
+    const char *search_terms;   /* URL-encoded search keywords for IA */
+} neighbourhood_t;
+
+/* Neighbourhoods are searched via radio-aporee-maps + location keywords.
+ * The IA title/description fields contain street names and landmarks. */
+static const neighbourhood_t MONTREAL_HOODS[] = {
+    {"Plateau",       "plateau+montreal"},
+    {"Mile End",      "mile+end+montreal"},
+    {"St-Henri",      "saint-henri+montreal"},
+    {"Hochelaga",     "hochelaga+montreal"},
+    {"Vieux-Mtl",     "vieux+montreal+old"},
+    {"Centre-Ville",  "centre+ville+downtown+montreal"},
+    {"Verdun",        "verdun+montreal"},
+    {"Rosemont",      "rosemont+montreal"},
+    {"NDG",           "notre+dame+grace+montreal"},
+    {"Villeray",      "villeray+parc+extension+montreal"},
+    {"Griffintown",   "griffintown+pointe+charles+montreal"},
+    {"Outremont",     "outremont+mile+ex+montreal"},
+    {"Parc Jarry",    "jarry+villeray+montreal"},
+    {"Mont-Royal",    "mont+royal+mountain+montreal"},
+    {"Lachine",       "lachine+canal+montreal"},
+    {"Ahuntsic",      "ahuntsic+cartierville+montreal"},
+};
+#define N_MONTREAL_HOODS (sizeof(MONTREAL_HOODS) / sizeof(MONTREAL_HOODS[0]))
 
 /* ── Descriptor Computation (simple, runs in fetch thread) ──────────────── */
 
@@ -310,23 +348,35 @@ static void compute_descriptors(float *pcm, int len, float *centroid, float *lou
     *noisiness = (lo_energy > 0.0001f) ? clampf(hi_energy / lo_energy, 0.0f, 1.0f) : 0.5f;
 }
 
+/* ── minimp3 decoder ────────────────────────────────────────────────────── */
+
+#define MINIMP3_IMPLEMENTATION
+#define MINIMP3_FLOAT_OUTPUT
+#include "minimp3.h"
+
 /* ── Fetch Thread ───────────────────────────────────────────────────────── */
 
 /*
- * The fetch thread runs in the background, periodically querying Freesound
- * or Internet Archive, downloading MP3 previews, decoding them, computing
- * descriptors, and swapping them into sound slots.
+ * v0.2: Real HTTP fetching from Freesound + Internet Archive.
  *
- * v0.1: STUB — generates synthetic micro-textures (filtered noise bursts)
- * as placeholder material until HTTP fetching is implemented.
- * This lets us test the entire voice engine immediately.
+ * Dual Seeder architecture (Interfera-inspired):
+ *   1. Freesound — tagged, descriptor-filtered short sounds (needs API key)
+ *   2. Internet Archive — field recordings, ambient textures (no key needed)
  *
- * v0.2 will replace the synthetic generation with:
- *   popen("curl -s 'https://freesound.org/apiv2/search/text/?query=...&token=KEY&fields=id,name,previews,duration&filter=duration:[0.5 TO 15]&page_size=15'")
- *   → parse JSON for preview URL
- *   → popen("curl -s -o /tmp/fouille_slot_N.mp3 <preview_url>")
- *   → minimp3 decode → descriptor computation → atomic swap
+ * Flow:
+ *   popen("curl") → search API → parse preview URL → download MP3
+ *   → minimp3 decode to float PCM → compute descriptors → atomic slot swap
+ *
+ * Falls back to synthetic textures if network is unavailable.
  */
+
+/* Path to curl on Move */
+#define CURL_PATH "/data/UserData/schwung/bin/curl"
+
+/* Max size for API response JSON buffer */
+#define JSON_BUF_SIZE  (64 * 1024)
+/* Max size for downloaded MP3 file */
+#define MP3_BUF_SIZE   (512 * 1024)
 
 static void generate_synthetic_texture(float *buf, int len, uint32_t *rng) {
     /* Generate a filtered noise burst with random character */
@@ -339,22 +389,483 @@ static void generate_synthetic_texture(float *buf, int len, uint32_t *rng) {
     float env = amp;
 
     for (int i = 0; i < len; i++) {
-        /* Noise source */
         float noise = (randf(rng) - 0.5f) * 2.0f;
-        /* One-pole LP filter */
         lp_z1 += alpha * (noise - lp_z1);
-        /* Decaying envelope */
         buf[i] = lp_z1 * env;
         env *= decay;
-        /* Occasional transient bursts */
         if ((xorshift32(rng) & 0xFFF) < 2) {
             env = amp * (0.5f + randf(rng) * 0.5f);
         }
     }
 }
 
+/* ── Simple JSON helpers (no library needed) ───────────────────────────── */
+
+/* Find a JSON string value by key — returns pointer into json, writes length.
+ * Only handles flat "key":"value" patterns (good enough for Freesound response). */
+static const char *json_find_string(const char *json, const char *key, int *out_len) {
+    char pattern[128];
+    snprintf(pattern, sizeof(pattern), "\"%s\":", key);
+    const char *p = strstr(json, pattern);
+    if (!p) return NULL;
+    p += strlen(pattern);
+    /* Skip whitespace */
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    if (*p != '"') return NULL;
+    p++;  /* skip opening quote */
+    const char *end = p;
+    while (*end && *end != '"') {
+        if (*end == '\\') end++;  /* skip escaped chars */
+        end++;
+    }
+    *out_len = (int)(end - p);
+    return p;
+}
+
+/* ── Read Freesound API key from file ──────────────────────────────────── */
+
+static int read_api_key(const char *module_dir, char *key_buf, int key_buf_len) {
+    char path[600];
+    snprintf(path, sizeof(path), "%s/freesound.key", module_dir);
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    if (!fgets(key_buf, key_buf_len, f)) { fclose(f); return 0; }
+    fclose(f);
+    /* Strip trailing whitespace/newline */
+    int len = (int)strlen(key_buf);
+    while (len > 0 && (key_buf[len-1] == '\n' || key_buf[len-1] == '\r' || key_buf[len-1] == ' '))
+        key_buf[--len] = '\0';
+    return len > 0;
+}
+
+/* ── Run a command and capture stdout into a buffer ────────────────────── */
+
+static int run_cmd_capture(const char *cmd, uint8_t *buf, int buf_size) {
+    FILE *pipe = popen(cmd, "r");
+    if (!pipe) return 0;
+    int total = 0;
+    while (total < buf_size - 1) {
+        size_t n = fread(buf + total, 1, (size_t)(buf_size - 1 - total), pipe);
+        if (n == 0) break;
+        total += (int)n;
+    }
+    pclose(pipe);
+    buf[total] = '\0';
+    return total;
+}
+
+/* ── Decode MP3 buffer to mono float PCM ───────────────────────────────── */
+
+static int decode_mp3_to_mono_float(const uint8_t *mp3_data, int mp3_size,
+                                     float *out, int out_capacity) {
+    mp3dec_t dec;
+    mp3dec_init(&dec);
+    mp3dec_frame_info_t info;
+    int total = 0;
+    int offset = 0;
+    float pcm[MINIMP3_MAX_SAMPLES_PER_FRAME];
+
+    while (offset < mp3_size && total < out_capacity) {
+        int samples = mp3dec_decode_frame(&dec,
+                          mp3_data + offset,
+                          mp3_size - offset,
+                          pcm, &info);
+        if (samples == 0 && info.frame_bytes == 0) break;
+        if (samples > 0) {
+            for (int i = 0; i < samples && total < out_capacity; i++) {
+                if (info.channels == 2) {
+                    out[total++] = (pcm[i * 2] + pcm[i * 2 + 1]) * 0.5f;
+                } else {
+                    out[total++] = pcm[i];
+                }
+            }
+        }
+        offset += info.frame_bytes;
+    }
+    return total;
+}
+
+/* ── Freesound seeder ──────────────────────────────────────────────────── */
+
+/* Try to fetch a sound from Freesound API.
+ * Returns number of PCM samples written to `out`, or 0 on failure. */
+static int fetch_freesound(fetch_context_t *ctx, float *out, int out_capacity) {
+    char api_key[128];
+    if (!read_api_key(ctx->module_dir, api_key, sizeof(api_key)))
+        return 0;  /* no API key */
+
+    /* Build search query from terrain category + poetic word */
+    int terrain = atomic_load(&ctx->terrain);
+    if (terrain < 0) terrain = 0;
+    if (terrain > 7) terrain = 7;
+    int word_idx = xorshift32(&ctx->rng) % 3;
+    const char *term = CATEGORY_TERMS[terrain][word_idx];
+
+    /* Also mix in a poetic word sometimes */
+    char query[256];
+    if (xorshift32(&ctx->rng) % 3 == 0) {
+        int pw = xorshift32(&ctx->rng) % N_POETIC_WORDS;
+        snprintf(query, sizeof(query), "%s+%s", term, POETIC_WORDS[pw]);
+    } else {
+        snprintf(query, sizeof(query), "%s", term);
+    }
+
+    /* Random page offset to get variety */
+    int page = 1 + (xorshift32(&ctx->rng) % 5);
+
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd),
+        CURL_PATH " -s --connect-timeout 5 --max-time 10 "
+        "\"https://freesound.org/apiv2/search/text/"
+        "?query=%s&filter=duration:%%5B0.5+TO+15%%5D"
+        "&fields=id,name,previews&page_size=15&page=%d"
+        "&token=%s\"",
+        query, page, api_key);
+
+    /* Allocate JSON buffer on heap (too large for stack) */
+    char *json = (char *)malloc(JSON_BUF_SIZE);
+    if (!json) return 0;
+
+    int json_len = run_cmd_capture(cmd, (uint8_t *)json, JSON_BUF_SIZE);
+    if (json_len < 50) { free(json); return 0; }  /* too short = error */
+
+    /* Pick a random result from the response */
+    /* Find all "preview-hq-mp3" URLs */
+    char preview_urls[15][512];
+    int n_urls = 0;
+    const char *search_pos = json;
+    while (n_urls < 15) {
+        int url_len = 0;
+        const char *url = json_find_string(search_pos, "preview-hq-mp3", &url_len);
+        if (!url || url_len <= 0 || url_len >= 511) break;
+        memcpy(preview_urls[n_urls], url, url_len);
+        preview_urls[n_urls][url_len] = '\0';
+        n_urls++;
+        search_pos = url + url_len;
+    }
+    free(json);
+
+    if (n_urls == 0) return 0;
+
+    /* Pick a random preview */
+    int pick = xorshift32(&ctx->rng) % n_urls;
+
+    /* Download the MP3 preview */
+    uint8_t *mp3_buf = (uint8_t *)malloc(MP3_BUF_SIZE);
+    if (!mp3_buf) return 0;
+
+    snprintf(cmd, sizeof(cmd),
+        CURL_PATH " -sL --connect-timeout 5 --max-time 15 \"%s\"",
+        preview_urls[pick]);
+
+    int mp3_size = run_cmd_capture(cmd, mp3_buf, MP3_BUF_SIZE);
+    if (mp3_size < 1000) { free(mp3_buf); return 0; }  /* too small = error */
+
+    /* Decode MP3 to mono float */
+    int samples = decode_mp3_to_mono_float(mp3_buf, mp3_size, out, out_capacity);
+    free(mp3_buf);
+
+    return samples;
+}
+
+/* ── Internet Archive seeder ───────────────────────────────────────────── */
+
+/* Try to fetch a sound from Internet Archive (no API key needed).
+ * Uses the radio-aporee-maps collection for field recordings,
+ * or general audio search with poetic terms.
+ * Returns number of PCM samples written to `out`, or 0 on failure. */
+static int fetch_internet_archive(fetch_context_t *ctx, float *out, int out_capacity) {
+    /* Build search query */
+    int terrain = atomic_load(&ctx->terrain);
+    if (terrain < 0) terrain = 0;
+    if (terrain > 7) terrain = 7;
+
+    /* Alternate between aporee field recordings and general audio search */
+    char query[256];
+    int use_aporee = (xorshift32(&ctx->rng) % 3 == 0);
+
+    if (use_aporee) {
+        /* Radio Aporee: field recordings from around the world */
+        int pw = xorshift32(&ctx->rng) % N_POETIC_WORDS;
+        snprintf(query, sizeof(query),
+            "collection:radio-aporee-maps+AND+%s", POETIC_WORDS[pw]);
+    } else {
+        int word_idx = xorshift32(&ctx->rng) % 3;
+        const char *term = CATEGORY_TERMS[terrain][word_idx];
+        int pw = xorshift32(&ctx->rng) % N_POETIC_WORDS;
+        snprintf(query, sizeof(query),
+            "%s+%s+AND+mediatype:audio", term, POETIC_WORDS[pw]);
+    }
+
+    int page = 1 + (xorshift32(&ctx->rng) % 3);
+
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd),
+        CURL_PATH " -s --connect-timeout 5 --max-time 10 "
+        "\"https://archive.org/advancedsearch.php"
+        "?q=%s&fl%%5B%%5D=identifier&fl%%5B%%5D=title"
+        "&rows=10&page=%d&output=json\"",
+        query, page);
+
+    char *json = (char *)malloc(JSON_BUF_SIZE);
+    if (!json) return 0;
+
+    int json_len = run_cmd_capture(cmd, (uint8_t *)json, JSON_BUF_SIZE);
+    if (json_len < 50) { free(json); return 0; }
+
+    /* Extract identifiers from response */
+    char identifiers[10][256];
+    int n_ids = 0;
+    const char *search_pos = json;
+    while (n_ids < 10) {
+        int id_len = 0;
+        const char *id = json_find_string(search_pos, "identifier", &id_len);
+        if (!id || id_len <= 0 || id_len >= 255) break;
+        memcpy(identifiers[n_ids], id, id_len);
+        identifiers[n_ids][id_len] = '\0';
+        n_ids++;
+        search_pos = id + id_len;
+    }
+    free(json);
+
+    if (n_ids == 0) return 0;
+
+    /* Pick a random item */
+    int pick = xorshift32(&ctx->rng) % n_ids;
+
+    /* Get file list for this item — look for an MP3 file */
+    snprintf(cmd, sizeof(cmd),
+        CURL_PATH " -s --connect-timeout 5 --max-time 10 "
+        "\"https://archive.org/metadata/%s/files\"",
+        identifiers[pick]);
+
+    json = (char *)malloc(JSON_BUF_SIZE);
+    if (!json) return 0;
+
+    json_len = run_cmd_capture(cmd, (uint8_t *)json, JSON_BUF_SIZE);
+    if (json_len < 20) { free(json); return 0; }
+
+    /* Find first .mp3 filename in the file list */
+    char mp3_filename[256] = {0};
+    const char *p = json;
+    while ((p = strstr(p, ".mp3")) != NULL) {
+        /* Walk back to find the opening quote of this filename */
+        const char *end = p + 4;  /* past ".mp3" */
+        /* Check this is inside a "name":"..." field */
+        const char *name_check = p;
+        while (name_check > json && *name_check != '"') name_check--;
+        if (name_check > json) {
+            const char *start = name_check + 1;
+            int fname_len = (int)(end - start);
+            if (fname_len > 0 && fname_len < 255) {
+                memcpy(mp3_filename, start, fname_len);
+                mp3_filename[fname_len] = '\0';
+                break;
+            }
+        }
+        p = end;
+    }
+    free(json);
+
+    if (mp3_filename[0] == '\0') return 0;
+
+    /* URL-encode spaces in filename */
+    char encoded_name[512];
+    int ei = 0;
+    for (int i = 0; mp3_filename[i] && ei < 500; i++) {
+        if (mp3_filename[i] == ' ') {
+            encoded_name[ei++] = '%';
+            encoded_name[ei++] = '2';
+            encoded_name[ei++] = '0';
+        } else {
+            encoded_name[ei++] = mp3_filename[i];
+        }
+    }
+    encoded_name[ei] = '\0';
+
+    /* Download the MP3 file (only first 512KB to limit large files) */
+    uint8_t *mp3_buf = (uint8_t *)malloc(MP3_BUF_SIZE);
+    if (!mp3_buf) return 0;
+
+    snprintf(cmd, sizeof(cmd),
+        CURL_PATH " -sL --connect-timeout 5 --max-time 20 "
+        "-r 0-%d "
+        "\"https://archive.org/download/%s/%s\"",
+        MP3_BUF_SIZE - 1, identifiers[pick], encoded_name);
+
+    int mp3_size = run_cmd_capture(cmd, mp3_buf, MP3_BUF_SIZE);
+    if (mp3_size < 1000) { free(mp3_buf); return 0; }
+
+    /* Decode MP3 to mono float */
+    int samples = decode_mp3_to_mono_float(mp3_buf, mp3_size, out, out_capacity);
+    free(mp3_buf);
+
+    return samples;
+}
+
+/* ── Geosonic seeder (Montreal neighbourhoods via radio-aporee-maps) ──── */
+
+/* Searches the radio-aporee-maps collection on Internet Archive for
+ * recordings from a specific Montreal neighbourhood.
+ * Uses the same MP3 download + decode pipeline as the IA seeder. */
+static int fetch_geosonic(fetch_context_t *ctx, float *out, int out_capacity) {
+    FILE *dbg = NULL;
+    int hood_idx = atomic_load(&ctx->neighbourhood);
+    if (hood_idx < 0) hood_idx = 0;
+    if (hood_idx >= (int)N_MONTREAL_HOODS) hood_idx = 0;
+
+    const neighbourhood_t *hood = &MONTREAL_HOODS[hood_idx];
+    int page = 1 + (xorshift32(&ctx->rng) % 3);
+
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd),
+        CURL_PATH " -s --connect-timeout 5 --max-time 10 "
+        "\"https://archive.org/advancedsearch.php"
+        "?q=collection:radio-aporee-maps+AND+(%s)"
+        "&fl%%5B%%5D=identifier&fl%%5B%%5D=title"
+        "&rows=15&page=%d&output=json\"",
+        hood->search_terms, page);
+
+    dbg = fopen("/tmp/fouille_fetch.log", "a");
+    if (dbg) { fprintf(dbg, "geosonic cmd: %s\n", cmd); fclose(dbg); }
+
+    char *json = (char *)malloc(JSON_BUF_SIZE);
+    if (!json) return 0;
+
+    int json_len = run_cmd_capture(cmd, (uint8_t *)json, JSON_BUF_SIZE);
+    dbg = fopen("/tmp/fouille_fetch.log", "a");
+    if (dbg) { fprintf(dbg, "geosonic search json_len=%d\n", json_len); fclose(dbg); }
+    if (json_len < 50) { free(json); return 0; }
+
+    /* Extract identifiers */
+    char identifiers[15][256];
+    int n_ids = 0;
+    const char *search_pos = json;
+    while (n_ids < 15) {
+        int id_len = 0;
+        const char *id = json_find_string(search_pos, "identifier", &id_len);
+        if (!id || id_len <= 0 || id_len >= 255) break;
+        memcpy(identifiers[n_ids], id, id_len);
+        identifiers[n_ids][id_len] = '\0';
+        n_ids++;
+        search_pos = id + id_len;
+    }
+    free(json);
+
+    /* If neighbourhood-specific search found nothing, try general Montreal */
+    if (n_ids == 0) {
+        snprintf(cmd, sizeof(cmd),
+            CURL_PATH " -s --connect-timeout 5 --max-time 10 "
+            "\"https://archive.org/advancedsearch.php"
+            "?q=collection:radio-aporee-maps+AND+montreal"
+            "&fl%%5B%%5D=identifier&fl%%5B%%5D=title"
+            "&rows=15&page=%d&output=json\"",
+            page);
+
+        json = (char *)malloc(JSON_BUF_SIZE);
+        if (!json) return 0;
+
+        json_len = run_cmd_capture(cmd, (uint8_t *)json, JSON_BUF_SIZE);
+        if (json_len < 50) { free(json); return 0; }
+
+        search_pos = json;
+        while (n_ids < 15) {
+            int id_len = 0;
+            const char *id = json_find_string(search_pos, "identifier", &id_len);
+            if (!id || id_len <= 0 || id_len >= 255) break;
+            memcpy(identifiers[n_ids], id, id_len);
+            identifiers[n_ids][id_len] = '\0';
+            n_ids++;
+            search_pos = id + id_len;
+        }
+        free(json);
+    }
+
+    dbg = fopen("/tmp/fouille_fetch.log", "a");
+    if (dbg) { fprintf(dbg, "geosonic n_ids=%d\n", n_ids); fclose(dbg); }
+    if (n_ids == 0) return 0;
+
+    /* Pick a random item */
+    int pick = xorshift32(&ctx->rng) % n_ids;
+    dbg = fopen("/tmp/fouille_fetch.log", "a");
+    if (dbg) { fprintf(dbg, "geosonic pick=%d id=%s\n", pick, identifiers[pick]); fclose(dbg); }
+
+    /* Get file list — look for an MP3 */
+    snprintf(cmd, sizeof(cmd),
+        CURL_PATH " -s --connect-timeout 5 --max-time 10 "
+        "\"https://archive.org/metadata/%s/files\"",
+        identifiers[pick]);
+
+    json = (char *)malloc(JSON_BUF_SIZE);
+    if (!json) return 0;
+
+    json_len = run_cmd_capture(cmd, (uint8_t *)json, JSON_BUF_SIZE);
+    if (json_len < 20) { free(json); return 0; }
+
+    /* Find first .mp3 filename */
+    char mp3_filename[256] = {0};
+    const char *p = json;
+    while ((p = strstr(p, ".mp3")) != NULL) {
+        const char *end = p + 4;
+        const char *name_check = p;
+        while (name_check > json && *name_check != '"') name_check--;
+        if (name_check > json) {
+            const char *start = name_check + 1;
+            int fname_len = (int)(end - start);
+            if (fname_len > 0 && fname_len < 255) {
+                memcpy(mp3_filename, start, fname_len);
+                mp3_filename[fname_len] = '\0';
+                break;
+            }
+        }
+        p = end;
+    }
+    free(json);
+
+    dbg = fopen("/tmp/fouille_fetch.log", "a");
+    if (dbg) { fprintf(dbg, "geosonic mp3=%s\n", mp3_filename[0] ? mp3_filename : "(none)"); fclose(dbg); }
+    if (mp3_filename[0] == '\0') return 0;
+
+    /* URL-encode spaces */
+    char encoded_name[512];
+    int ei = 0;
+    for (int i = 0; mp3_filename[i] && ei < 500; i++) {
+        if (mp3_filename[i] == ' ') {
+            encoded_name[ei++] = '%'; encoded_name[ei++] = '2'; encoded_name[ei++] = '0';
+        } else {
+            encoded_name[ei++] = mp3_filename[i];
+        }
+    }
+    encoded_name[ei] = '\0';
+
+    /* Download MP3 */
+    uint8_t *mp3_buf = (uint8_t *)malloc(MP3_BUF_SIZE);
+    if (!mp3_buf) return 0;
+
+    snprintf(cmd, sizeof(cmd),
+        CURL_PATH " -sL --connect-timeout 5 --max-time 20 "
+        "-r 0-%d "
+        "\"https://archive.org/download/%s/%s\"",
+        MP3_BUF_SIZE - 1, identifiers[pick], encoded_name);
+
+    int mp3_size = run_cmd_capture(cmd, mp3_buf, MP3_BUF_SIZE);
+    dbg = fopen("/tmp/fouille_fetch.log", "a");
+    if (dbg) { fprintf(dbg, "geosonic mp3_size=%d\n", mp3_size); fclose(dbg); }
+    if (mp3_size < 1000) { free(mp3_buf); return 0; }
+
+    int samples = decode_mp3_to_mono_float(mp3_buf, mp3_size, out, out_capacity);
+    dbg = fopen("/tmp/fouille_fetch.log", "a");
+    if (dbg) { fprintf(dbg, "geosonic decoded=%d samples\n", samples); fclose(dbg); }
+    free(mp3_buf);
+
+    return samples;
+}
+
+/* ── Main fetch thread ─────────────────────────────────────────────────── */
+
 static void *fetch_thread_func(void *arg) {
     fetch_context_t *ctx = (fetch_context_t *)arg;
+    int use_ia_next = 0;  /* alternate between Freesound and IA */
 
     while (atomic_load(&ctx->running)) {
         int flow_sec = atomic_load(&ctx->flow_seconds);
@@ -363,7 +874,6 @@ static void *fetch_thread_func(void *arg) {
         /* Sleep in 1-second intervals, checking for shutdown and urgent requests */
         for (int s = 0; s < flow_sec && atomic_load(&ctx->running); s++) {
             sleep(1);
-            /* Check if a pad-triggered urgent fetch was requested */
             if (atomic_load(&ctx->fetch_requested)) {
                 atomic_store(&ctx->fetch_requested, 0);
                 break;
@@ -382,7 +892,7 @@ static void *fetch_thread_func(void *arg) {
                 break;
             }
         }
-        if (target < 0) continue;  /* all slots busy */
+        if (target < 0) continue;
 
         atomic_store(&ctx->slots[target].state, SLOT_LOADING);
 
@@ -390,10 +900,47 @@ static void *fetch_thread_func(void *arg) {
         int live = atomic_load(&ctx->slots[target].active_buf);
         float *shadow = (live == 0) ? ctx->slots[target].pcm_b : ctx->slots[target].pcm_a;
 
-        /* v0.1: Generate synthetic texture (placeholder for HTTP fetch) */
-        int len = 22050 * (2 + (xorshift32(&ctx->rng) % 8));  /* 2-10 seconds */
-        if (len > MAX_SLOT_SAMPLES) len = MAX_SLOT_SAMPLES;
-        generate_synthetic_texture(shadow, len, &ctx->rng);
+        /* Try to fetch from the internet */
+        int len = 0;
+        int current_mode = atomic_load(&ctx->mode);
+
+        /* Debug log */
+        {
+            FILE *dbg = fopen("/tmp/fouille_fetch.log", "a");
+            if (dbg) {
+                fprintf(dbg, "fetch: mode=%d hood=%d target=%d\n",
+                        current_mode, atomic_load(&ctx->neighbourhood), target);
+                fclose(dbg);
+            }
+        }
+
+        if (current_mode == 1) {
+            /* Cities mode — geosonic seeder */
+            len = fetch_geosonic(ctx, shadow, MAX_SLOT_SAMPLES);
+            {
+                FILE *dbg = fopen("/tmp/fouille_fetch.log", "a");
+                if (dbg) { fprintf(dbg, "geosonic returned %d samples\n", len); fclose(dbg); }
+            }
+        } else {
+            /* Fouille mode — alternate Freesound and IA */
+            if (use_ia_next) {
+                len = fetch_internet_archive(ctx, shadow, MAX_SLOT_SAMPLES);
+                if (len < 100)
+                    len = fetch_freesound(ctx, shadow, MAX_SLOT_SAMPLES);
+            } else {
+                len = fetch_freesound(ctx, shadow, MAX_SLOT_SAMPLES);
+                if (len < 100)
+                    len = fetch_internet_archive(ctx, shadow, MAX_SLOT_SAMPLES);
+            }
+            use_ia_next = !use_ia_next;
+        }
+
+        /* If both seeders failed, generate synthetic texture as fallback */
+        if (len < 100) {
+            len = 22050 * (2 + (xorshift32(&ctx->rng) % 8));
+            if (len > MAX_SLOT_SAMPLES) len = MAX_SLOT_SAMPLES;
+            generate_synthetic_texture(shadow, len, &ctx->rng);
+        }
 
         /* Compute descriptors */
         float centroid, loudness, noisiness;
@@ -405,8 +952,10 @@ static void *fetch_thread_func(void *arg) {
         ctx->slots[target].loudness = loudness;
         ctx->slots[target].noisiness = noisiness;
         ctx->slots[target].fetch_time = ctx->tick++;
-        atomic_store(&ctx->slots[target].active_buf, live == 0 ? 1 : 0);
-        atomic_store(&ctx->slots[target].state, SLOT_READY);
+        atomic_store_explicit(&ctx->slots[target].active_buf,
+                              live == 0 ? 1 : 0, memory_order_release);
+        atomic_store_explicit(&ctx->slots[target].state,
+                              SLOT_READY, memory_order_release);
 
         ctx->next_slot = (target + 1) % N_SLOTS;
     }
@@ -417,17 +966,18 @@ static void *fetch_thread_func(void *arg) {
 /* ── Corpus Navigator ───────────────────────────────────────────────────── */
 
 /*
- * Map a pad note to a 2D descriptor coordinate and find the closest sound slot.
- * Move pads: bottom-left = note 36, 4 rows × 8 cols, row-major.
- *   Row 0 (bottom): 36-43, Row 1: 44-51, Row 2: 52-59, Row 3: 60-67
+ * Map a MIDI note to a descriptor coordinate and find the closest sound slot.
  *
- * X axis (column, 0-7): mapped to loudness (quiet → loud)
- * Y axis (row, 0-3): mapped to centroid (dark → bright)
+ * The Move sends notes based on the user's scale/root settings, NOT fixed pad
+ * positions. So we use the note pitch itself to navigate the descriptor space:
+ *   - Note pitch (0-127) → target centroid (dark → bright)
+ *   - Velocity → target loudness (quiet → loud)
+ *
+ * Lower notes seek darker sounds, higher notes seek brighter sounds.
+ * Soft hits seek quiet sounds, hard hits seek loud sounds.
  */
 
-static int corpus_find_nearest_slot(fouille_instance_t *inst, int col, int row) {
-    float target_loudness = (float)col / 7.0f;
-    float target_centroid = (float)row / 3.0f;
+static int corpus_find_nearest_slot(fouille_instance_t *inst, float target_centroid, float target_loudness) {
 
     int best = -1;
     float best_dist = 1e9f;
@@ -445,8 +995,8 @@ static int corpus_find_nearest_slot(fouille_instance_t *inst, int col, int row) 
         }
     }
 
-    /* Fallback: if no slots ready, return slot 0 */
-    return (best >= 0) ? best : 0;
+    /* Fallback: -1 if no material available */
+    return best;
 }
 
 /* ── Lifecycle ──────────────────────────────────────────────────────────── */
@@ -485,7 +1035,7 @@ static void *create_instance(const char *module_dir, const char *json_defaults) 
     inst->param_terrain  = 0.0f;
     inst->param_depth    = 0.5f;
     inst->param_rise     = 0.1f;    /* ~200ms attack */
-    inst->param_hold     = 0.0f;    /* freeze mode */
+    inst->param_hold     = 0.5f;    /* drift mode */
     inst->param_fall     = 0.3f;    /* ~1.5s decay */
     inst->param_strike   = 0.3f;    /* moderate nonlinearity */
     inst->param_lock     = 0.0f;    /* spectral lock bypassed */
@@ -498,13 +1048,31 @@ static void *create_instance(const char *module_dir, const char *json_defaults) 
     inst->param_drift    = 0.3f;    /* moderate drift */
     inst->param_pool     = 0.0f;    /* echo pool off */
     inst->param_spread   = 0.7f;    /* wide stereo */
-    inst->param_volume   = 0.3f;    /* LOW default — lowercase headroom */
+    inst->param_volume   = 0.6f;    /* moderate default — audible but not hot */
 
     inst->rng = 0x12345678;
 
-    /* Start fetch thread */
+    /* Pre-fill all slots with synthetic textures so sound is immediate */
+    {
+        uint32_t init_rng = 0xCAFE0000;
+        for (int i = 0; i < N_SLOTS; i++) {
+            int len = 22050 * (2 + (xorshift32(&init_rng) % 8));
+            if (len > MAX_SLOT_SAMPLES) len = MAX_SLOT_SAMPLES;
+            generate_synthetic_texture(inst->slots[i].pcm_a, len, &init_rng);
+            inst->slots[i].length = len;
+            float centroid, loudness, noisiness;
+            compute_descriptors(inst->slots[i].pcm_a, len, &centroid, &loudness, &noisiness);
+            inst->slots[i].centroid = centroid;
+            inst->slots[i].loudness = loudness;
+            inst->slots[i].noisiness = noisiness;
+            atomic_store(&inst->slots[i].active_buf, 0);
+            atomic_store(&inst->slots[i].state, SLOT_READY);
+        }
+    }
+
+    /* Start fetch thread (will rotate in new textures over time) */
     inst->fetch.slots = inst->slots;
-    inst->fetch.rng = 0xFE7CH0000;
+    inst->fetch.rng = 0xFE7C0000;
     inst->fetch.next_slot = 0;
     atomic_store(&inst->fetch.running, 1);
     atomic_store(&inst->fetch.fetch_requested, 0);
@@ -552,15 +1120,11 @@ static void on_midi(void *instance, const uint8_t *msg, int len, int source) {
         inst->voice_cursor = (vi + 1) % N_VOICES;
         voice_t *v = &inst->voices[vi];
 
-        /* Map pad note to grid position */
-        int pad_idx = note - 36;
-        if (pad_idx < 0) pad_idx = 0;
-        if (pad_idx > 31) pad_idx = 31;
-        int col = pad_idx % 8;
-        int row = pad_idx / 8;
-
-        /* Corpus Navigator: find nearest slot by descriptor distance */
-        int slot = corpus_find_nearest_slot(inst, col, row);
+        /* Corpus Navigator: note pitch → centroid, velocity → loudness */
+        float target_centroid = clampf((float)(note - 36) / 48.0f, 0.0f, 1.0f);
+        float target_loudness = vel / 127.0f;
+        int slot = corpus_find_nearest_slot(inst, target_centroid, target_loudness);
+        if (slot < 0) return;  /* no material available yet */
 
         v->active = 1;
         v->note = note;
@@ -573,10 +1137,10 @@ static void on_midi(void *instance, const uint8_t *msg, int len, int source) {
         float stretch_exp = powf(2.0f, (inst->param_stretch - 0.5f) * 4.0f);
         v->play_speed = stretch_exp;
 
-        /* Slice position: base from Position mapping + velocity scatter */
+        /* Slice position: note pitch maps into the sound + velocity scatter */
         int slot_len = inst->slots[slot].length;
         if (slot_len < 1) slot_len = 1;
-        float base_pos = (float)col / 7.0f;  /* column maps to position */
+        float base_pos = target_centroid;  /* pitch maps to position in the sound */
         float scatter = inst->param_scatter * v->velocity * (randf(&inst->rng) - 0.5f) * 2.0f;
         float start_frac = clampf(base_pos + scatter * 0.3f, 0.0f, 0.95f);
         v->read_pos = start_frac * (float)slot_len;
@@ -592,8 +1156,8 @@ static void on_midi(void *instance, const uint8_t *msg, int len, int source) {
         /* Reset LPG */
         vactrol_reset(&v->lpg);
 
-        /* Pan: based on column position + spread */
-        float base_pan = ((float)col / 7.0f) * 2.0f - 1.0f;
+        /* Pan: note pitch maps to stereo field + spread */
+        float base_pan = target_centroid * 2.0f - 1.0f;
         v->pan = base_pan * inst->param_spread;
 
         /* Grain state for HOLD_GRANULATE */
@@ -644,6 +1208,17 @@ static const knob_def_t PAGE_CURRENTS[8] = {
     {"volume",  "Volume",   0, 1, 0.01f},
 };
 
+static const knob_def_t PAGE_LOCATION[8] = {
+    {"mode",    "Mode",     0, 1, 0.01f},
+    {"city",    "City",     0, 1, 0.01f},
+    {"hood",    "Hood",     0, 1, 0.01f},
+    {"rise",    "Rise",     0, 1, 0.01f},
+    {"hold",    "Hold",     0, 1, 0.01f},
+    {"fall",    "Fall",     0, 1, 0.01f},
+    {"flow",    "Flow",     0, 1, 0.01f},
+    {"volume",  "Volume",   0, 1, 0.01f},
+};
+
 static float *get_param_ptr(fouille_instance_t *inst, const char *key) {
     if (strcmp(key, "terrain")  == 0) return &inst->param_terrain;
     if (strcmp(key, "depth")    == 0) return &inst->param_depth;
@@ -661,12 +1236,15 @@ static float *get_param_ptr(fouille_instance_t *inst, const char *key) {
     if (strcmp(key, "pool")     == 0) return &inst->param_pool;
     if (strcmp(key, "spread")   == 0) return &inst->param_spread;
     if (strcmp(key, "volume")   == 0) return &inst->param_volume;
+    /* mode and hood are enums — handled separately in get_param/set_param */
     return NULL;
 }
 
 static const knob_def_t *get_active_page(fouille_instance_t *inst, int *page_out) {
     if (page_out) *page_out = inst->current_page;
-    return (inst->current_page == 0) ? PAGE_EXCAVATION : PAGE_CURRENTS;
+    if (inst->current_page == 0) return PAGE_EXCAVATION;
+    if (inst->current_page == 2) return PAGE_LOCATION;
+    return PAGE_CURRENTS;
 }
 
 static void set_param(void *instance, const char *key, const char *val) {
@@ -689,24 +1267,14 @@ static void set_param(void *instance, const char *key, const char *val) {
 
     /* Page navigation */
     if (strcmp(key, "page") == 0) {
-        inst->current_page = atoi(val);
+        int pg = atoi(val);
+        inst->current_page = (pg >= 0 && pg <= 2) ? pg : 0;
         return;
     }
 
-    /* Direct param set */
-    float *p = get_param_ptr(inst, key);
-    if (p) {
-        *p = clampf(atof(val), 0.0f, 1.0f);
-    }
-
-    /* Sync fetch thread params */
-    atomic_store(&inst->fetch.terrain, (int)(inst->param_terrain * 7.99f));
-    atomic_store(&inst->fetch.depth_pct, (int)(inst->param_depth * 100.0f));
-    atomic_store(&inst->fetch.flow_seconds, 5 + (int)(inst->param_flow * 115.0f));
-
-    /* State deserialization */
+    /* State deserialization (must come before fetch sync) */
     if (strcmp(key, "state") == 0) {
-        sscanf(val, "%f %f %f %f %f %f %f %f %f %f %f %f %f %f %f %f",
+        sscanf(val, "%f %f %f %f %f %f %f %f %f %f %f %f %f %f %f %f %f %f",
                &inst->param_terrain, &inst->param_depth,
                &inst->param_rise, &inst->param_hold,
                &inst->param_fall, &inst->param_strike,
@@ -714,16 +1282,55 @@ static void set_param(void *instance, const char *key, const char *val) {
                &inst->param_flow, &inst->param_scatter,
                &inst->param_stretch, &inst->param_grain,
                &inst->param_drift, &inst->param_pool,
-               &inst->param_spread, &inst->param_volume);
+               &inst->param_spread, &inst->param_volume,
+               &inst->param_mode, &inst->param_hood);
+    } else if (strcmp(key, "mode") == 0) {
+        /* Enum: "Fouille" → 0, "Cities" → 1 */
+        if (strcmp(val, "Cities") == 0) inst->param_mode = 1.0f;
+        else inst->param_mode = 0.0f;
+    } else if (strcmp(key, "city") == 0) {
+        /* Enum: only "Montreal" for now → 0 */
+        inst->param_city = 0.0f;
+    } else if (strcmp(key, "hood") == 0) {
+        /* Enum: match neighbourhood name to index */
+        for (int i = 0; i < (int)N_MONTREAL_HOODS; i++) {
+            if (strcmp(val, MONTREAL_HOODS[i].name) == 0) {
+                inst->param_hood = (float)i / (float)(N_MONTREAL_HOODS - 1);
+                break;
+            }
+        }
+    } else {
+        /* Direct param set */
+        float *p = get_param_ptr(inst, key);
+        if (p) {
+            *p = clampf(atof(val), 0.0f, 1.0f);
+        }
+    }
+
+    /* Sync fetch thread params */
+    atomic_store(&inst->fetch.terrain, (int)(inst->param_terrain * 7.99f));
+    atomic_store(&inst->fetch.depth_pct, (int)(inst->param_depth * 100.0f));
+    atomic_store(&inst->fetch.flow_seconds, 5 + (int)(inst->param_flow * 115.0f));
+    {
+        int new_mode = (inst->param_mode >= 0.5f) ? 1 : 0;
+        int old_mode = atomic_load(&inst->fetch.mode);
+        atomic_store(&inst->fetch.mode, new_mode);
+        int new_hood = (int)(inst->param_hood * (float)(N_MONTREAL_HOODS - 1) + 0.5f);
+        int old_hood = atomic_load(&inst->fetch.neighbourhood);
+        atomic_store(&inst->fetch.neighbourhood, new_hood);
+        /* Force immediate fetch when mode or neighbourhood changes */
+        if (new_mode != old_mode || new_hood != old_hood) {
+            atomic_store(&inst->fetch.fetch_requested, 1);
+        }
     }
 }
 
 static int get_param(void *instance, const char *key, char *buf, int buf_len) {
     fouille_instance_t *inst = (fouille_instance_t *)instance;
 
-    /* chain_params */
+    /* chain_params — memcpy pattern to avoid truncation */
     if (strcmp(key, "chain_params") == 0) {
-        return snprintf(buf, buf_len,
+        static const char *cp =
             "["
             "{\"key\":\"terrain\",\"name\":\"Terrain\",\"type\":\"float\",\"min\":0,\"max\":1,\"step\":0.01},"
             "{\"key\":\"depth\",\"name\":\"Depth\",\"type\":\"float\",\"min\":0,\"max\":1,\"step\":0.01},"
@@ -740,8 +1347,38 @@ static int get_param(void *instance, const char *key, char *buf, int buf_len) {
             "{\"key\":\"drift\",\"name\":\"Drift\",\"type\":\"float\",\"min\":0,\"max\":1,\"step\":0.01},"
             "{\"key\":\"pool\",\"name\":\"Pool\",\"type\":\"float\",\"min\":0,\"max\":1,\"step\":0.01},"
             "{\"key\":\"spread\",\"name\":\"Spread\",\"type\":\"float\",\"min\":0,\"max\":1,\"step\":0.01},"
-            "{\"key\":\"volume\",\"name\":\"Volume\",\"type\":\"float\",\"min\":0,\"max\":1,\"step\":0.01}"
-            "]");
+            "{\"key\":\"volume\",\"name\":\"Volume\",\"type\":\"float\",\"min\":0,\"max\":1,\"step\":0.01},"
+            "{\"key\":\"mode\",\"name\":\"Mode\",\"type\":\"enum\",\"options\":[\"Fouille\",\"Cities\"]},"
+            "{\"key\":\"city\",\"name\":\"City\",\"type\":\"enum\",\"options\":[\"Montreal\"]},"
+            "{\"key\":\"hood\",\"name\":\"Hood\",\"type\":\"enum\",\"options\":[\"Plateau\",\"Mile End\",\"St-Henri\",\"Hochelaga\",\"Vieux-Mtl\",\"Centre-Ville\",\"Verdun\",\"Rosemont\",\"NDG\",\"Villeray\",\"Griffintown\",\"Outremont\",\"Parc Jarry\",\"Mont-Royal\",\"Lachine\",\"Ahuntsic\"]}"
+            "]";
+        int len = (int)strlen(cp);
+        if (len >= buf_len) return -1;
+        memcpy(buf, cp, len + 1);
+        return len;
+    }
+
+    /* ui_hierarchy — MUST be in get_param for synths (module.json alone not enough) */
+    if (strcmp(key, "ui_hierarchy") == 0) {
+        static const char *hier =
+            "{\"levels\":{"
+            "\"root\":{\"name\":\"Fouille\","
+            "\"knobs\":[\"terrain\",\"depth\",\"rise\",\"hold\",\"fall\",\"strike\",\"lock\",\"erode\"],"
+            "\"params\":[{\"level\":\"Excavation\",\"label\":\"Excavation\"},{\"level\":\"Currents\",\"label\":\"Currents\"},{\"level\":\"Location\",\"label\":\"Location\"}]},"
+            "\"Excavation\":{\"label\":\"Excavation\","
+            "\"knobs\":[\"terrain\",\"depth\",\"rise\",\"hold\",\"fall\",\"strike\",\"lock\",\"erode\"],"
+            "\"params\":[\"terrain\",\"depth\",\"rise\",\"hold\",\"fall\",\"strike\",\"lock\",\"erode\"]},"
+            "\"Currents\":{\"label\":\"Currents\","
+            "\"knobs\":[\"flow\",\"scatter\",\"stretch\",\"grain\",\"drift\",\"pool\",\"spread\",\"volume\"],"
+            "\"params\":[\"flow\",\"scatter\",\"stretch\",\"grain\",\"drift\",\"pool\",\"spread\",\"volume\"]},"
+            "\"Location\":{\"label\":\"Location\","
+            "\"knobs\":[\"mode\",\"city\",\"hood\",\"rise\",\"hold\",\"fall\",\"flow\",\"volume\"],"
+            "\"params\":[\"mode\",\"city\",\"hood\",\"rise\",\"hold\",\"fall\",\"flow\",\"volume\"]}"
+            "}}";
+        int len = (int)strlen(hier);
+        if (len >= buf_len) return -1;
+        memcpy(buf, hier, len + 1);
+        return len;
     }
 
     /* Knob names (Shadow UI popup) */
@@ -751,7 +1388,7 @@ static int get_param(void *instance, const char *key, char *buf, int buf_len) {
             const knob_def_t *page = get_active_page(inst, NULL);
             return snprintf(buf, buf_len, "%s", page[idx].label);
         }
-        return 0;
+        return -1;
     }
 
     /* Knob values (Shadow UI popup) */
@@ -773,10 +1410,25 @@ static int get_param(void *instance, const char *key, char *buf, int buf_len) {
                     if (*p < 0.66f) return snprintf(buf, buf_len, "Drift");
                     return snprintf(buf, buf_len, "Grain");
                 }
+                /* Special display for Mode */
+                if (strcmp(page[idx].key, "mode") == 0) {
+                    return snprintf(buf, buf_len, "%s", (*p < 0.5f) ? "Fouille" : "Cities");
+                }
+                /* Special display for City */
+                if (strcmp(page[idx].key, "city") == 0) {
+                    return snprintf(buf, buf_len, "Montreal");
+                }
+                /* Special display for Neighbourhood */
+                if (strcmp(page[idx].key, "hood") == 0) {
+                    int hi = (int)(*p * (float)(N_MONTREAL_HOODS - 1) + 0.5f);
+                    if (hi < 0) hi = 0;
+                    if (hi >= (int)N_MONTREAL_HOODS) hi = (int)N_MONTREAL_HOODS - 1;
+                    return snprintf(buf, buf_len, "%s", MONTREAL_HOODS[hi].name);
+                }
                 return snprintf(buf, buf_len, "%d%%", (int)(*p * 100));
             }
         }
-        return 0;
+        return -1;
     }
 
     /* Module name */
@@ -792,6 +1444,24 @@ static int get_param(void *instance, const char *key, char *buf, int buf_len) {
         return snprintf(buf, buf_len, "%d/%d slots", ready, N_SLOTS);
     }
 
+    /* Enum param: mode */
+    if (strcmp(key, "mode") == 0) {
+        return snprintf(buf, buf_len, "%s", (inst->param_mode >= 0.5f) ? "Cities" : "Fouille");
+    }
+
+    /* Enum param: city */
+    if (strcmp(key, "city") == 0) {
+        return snprintf(buf, buf_len, "Montreal");
+    }
+
+    /* Enum param: hood */
+    if (strcmp(key, "hood") == 0) {
+        int hi = (int)(inst->param_hood * (float)(N_MONTREAL_HOODS - 1) + 0.5f);
+        if (hi < 0) hi = 0;
+        if (hi >= (int)N_MONTREAL_HOODS) hi = (int)N_MONTREAL_HOODS - 1;
+        return snprintf(buf, buf_len, "%s", MONTREAL_HOODS[hi].name);
+    }
+
     /* Individual param values */
     float *p = get_param_ptr(inst, key);
     if (p) return snprintf(buf, buf_len, "%.4f", *p);
@@ -799,7 +1469,7 @@ static int get_param(void *instance, const char *key, char *buf, int buf_len) {
     /* State serialization */
     if (strcmp(key, "state") == 0) {
         return snprintf(buf, buf_len,
-            "%f %f %f %f %f %f %f %f %f %f %f %f %f %f %f %f",
+            "%.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g",
             inst->param_terrain, inst->param_depth,
             inst->param_rise, inst->param_hold,
             inst->param_fall, inst->param_strike,
@@ -807,7 +1477,8 @@ static int get_param(void *instance, const char *key, char *buf, int buf_len) {
             inst->param_flow, inst->param_scatter,
             inst->param_stretch, inst->param_grain,
             inst->param_drift, inst->param_pool,
-            inst->param_spread, inst->param_volume);
+            inst->param_spread, inst->param_volume,
+            inst->param_mode, inst->param_hood);
     }
 
     return -1;  /* unknown key */
@@ -815,8 +1486,14 @@ static int get_param(void *instance, const char *key, char *buf, int buf_len) {
 
 /* ── Audio Processing ───────────────────────────────────────────────────── */
 
+/* Fast tanh approximation: x / (1 + |x|) — no libm call */
+static inline float fast_tanh(float x) {
+    return x / (1.0f + fabsf(x));
+}
+
 static void render_block(void *instance, int16_t *out_lr, int frames) {
     fouille_instance_t *inst = (fouille_instance_t *)instance;
+    if (frames > BLOCK_SIZE) frames = BLOCK_SIZE;
 
     /* Vactrol model parameters derived from knobs */
     float rise_rate = 0.01f + (1.0f - inst->param_rise) * 0.09f;   /* faster rise → higher rate */
@@ -843,7 +1520,14 @@ static void render_block(void *instance, int16_t *out_lr, int frames) {
         int live_buf = atomic_load(&slot->active_buf);
         float *pcm = (live_buf == 0) ? slot->pcm_a : slot->pcm_b;
         int slot_len = slot->length;
-        if (slot_len < 1) { v->active = 0; continue; }
+        if (slot_len < 2) { v->active = 0; continue; }
+
+        /* Pre-compute per-voice constants (hoisted from per-sample loop) */
+        float vel_shaped = powf(v->velocity, 1.0f + nonlinearity);
+        float pan = clampf(v->pan + drift_process(&v->drift_pan, drift_depth * 0.3f), -1.0f, 1.0f);
+        float pan_angle = (pan + 1.0f) * 0.25f * (float)M_PI;
+        float pan_gain_l = cosf(pan_angle);
+        float pan_gain_r = sinf(pan_angle);
 
         for (int i = 0; i < frames; i++) {
             /* ── Ternary Envelope ── */
@@ -887,7 +1571,8 @@ static void render_block(void *instance, int16_t *out_lr, int frames) {
             if (v->env_stage == ENV_HOLD) {
                 switch (hold_mode) {
                     case HOLD_FREEZE:
-                        /* Don't advance — freeze at current position */
+                        /* Very slow crawl — not dead stop, avoids DC */
+                        v->read_pos += v->play_speed * 0.02f;
                         break;
                     case HOLD_DRIFT:
                         /* Slow scan with organic drift */
@@ -916,17 +1601,12 @@ static void render_block(void *instance, int16_t *out_lr, int frames) {
             if (v->read_pos < 0.0f) v->read_pos = (float)(slot_len - 1);
 
             /* ── Vactrol LPG ── */
-            float vel_shaped = powf(v->velocity, 1.0f + nonlinearity);
             v->lpg.vactrol_cv = v->env_level * vel_shaped;
             float processed = vactrol_process(&v->lpg, sample, rise_rate, fall_rate, nonlinearity);
 
-            /* ── Pan + mix ── */
-            float pan = clampf(v->pan + drift_process(&v->drift_pan, drift_depth * 0.3f), -1.0f, 1.0f);
-            float gain_l = cosf((pan + 1.0f) * 0.25f * (float)M_PI);
-            float gain_r = sinf((pan + 1.0f) * 0.25f * (float)M_PI);
-
-            mix_buf_l[i] += processed * gain_l;
-            mix_buf_r[i] += processed * gain_r;
+            /* ── Pan + mix (using pre-computed gains, update slowly via drift) ── */
+            mix_buf_l[i] += processed * pan_gain_l;
+            mix_buf_r[i] += processed * pan_gain_r;
         }
     }
 
@@ -958,14 +1638,15 @@ static void render_block(void *instance, int16_t *out_lr, int frames) {
         if (inst->param_erode > 0.001f) {
             float erode_alpha = 0.05f + (1.0f - inst->param_erode) * 0.95f;
             inst->erosion_lp_z1 += erode_alpha * ((l + r) * 0.5f - inst->erosion_lp_z1);
+            if (fabsf(inst->erosion_lp_z1) < 1e-15f) inst->erosion_lp_z1 = 0.0f;
             float eroded = inst->erosion_lp_z1;
             l = lerpf(l, eroded, inst->param_erode);
             r = lerpf(r, eroded, inst->param_erode);
         }
 
-        /* Soft limiter (tanh) — lowercase-safe companding */
-        l = tanhf(l * 2.0f) * volume;
-        r = tanhf(r * 2.0f) * volume;
+        /* Soft limiter — lowercase-safe companding */
+        l = fast_tanh(l * 2.0f) * volume;
+        r = fast_tanh(r * 2.0f) * volume;
 
         /* Output */
         int16_t sl = (int16_t)(clampf(l, -1.0f, 1.0f) * 32767.0f);
